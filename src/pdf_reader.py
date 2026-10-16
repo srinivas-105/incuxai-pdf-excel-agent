@@ -1,99 +1,102 @@
-import io
-import re
-import fitz
-import pdfplumber
-import pandas as pd
-import pytesseract
-from PIL import Image
-from src.table_stitcher import normalize_table, stitch_tables
 
-
-def _clean_cell(value):
-    if value is None:
-        return ""
-    return re.sub(r"\s+", " ", str(value)).strip()
-
-
-def _extract_digital_page(page):
-    found = []
-    try:
-        raw_tables = page.extract_tables({
-            "vertical_strategy": "lines",
-            "horizontal_strategy": "lines",
-            "intersection_tolerance": 5,
-        })
-        if not raw_tables:
-            raw_tables = page.extract_tables({
-                "vertical_strategy": "text",
-                "horizontal_strategy": "text",
-                "snap_tolerance": 3,
-            })
-        for raw in raw_tables or []:
-            rows = [[_clean_cell(c) for c in row] for row in raw if row and any(_clean_cell(c) for c in row)]
-            if len(rows) >= 2 and max((len(r) for r in rows), default=0) >= 2:
-                found.append(rows)
-    except Exception:
-        pass
-    return found
-
-
-def _ocr_page(pdf_bytes, page_index, dpi=220):
+def _ocr_page(pdf_bytes, page_index, dpi=300):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc.load_page(page_index)
-    pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), alpha=False)
-    image = Image.open(io.BytesIO(pix.tobytes("png")))
-    text = pytesseract.image_to_string(image, config="--psm 6")
-    doc.close()
-    # Basic OCR fallback: split text rows on repeated spaces or tabs.
-    # OCR is not a full table-layout engine; flag this method for human review.
-    rows = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
+    try:
+        page = doc.load_page(page_index)
+        pix = page.get_pixmap(
+            matrix=fitz.Matrix(dpi / 72, dpi / 72),
+            alpha=False
+        )
+        image = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+    finally:
+        doc.close()
+
+    # Get each recognized word and its position on the page.
+    data = pytesseract.image_to_data(
+        image,
+        config="--psm 6",
+        output_type=pytesseract.Output.DICT
+    )
+
+    words = []
+    for i, raw in enumerate(data["text"]):
+        word = _clean_cell(raw)
+        try:
+            confidence = float(data["conf"][i])
+        except (ValueError, TypeError):
+            confidence = -1
+
+        if not word or confidence < 20:
             continue
-        parts = re.split(r"\s{2,}|\t+", line)
-        parts = [_clean_cell(p) for p in parts if _clean_cell(p)]
-        if len(parts) >= 2:
-            rows.append(parts)
-    if len(rows) >= 2:
-        return rows
-    return []
 
+        left = int(data["left"][i])
+        top = int(data["top"][i])
+        width = int(data["width"][i])
+        height = int(data["height"][i])
 
-def extract_pdf(pdf_bytes, use_ocr=True, max_pages=50):
-    page_log = []
-    page_tables = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        total = len(pdf.pages)
-        if total > max_pages:
-            raise ValueError(f"PDF has {total} pages; configured limit is {max_pages}.")
-        for page_no, page in enumerate(pdf.pages, start=1):
-            tables = _extract_digital_page(page)
-            method = "pdfplumber"
-            if not tables and use_ocr:
-                try:
-                    ocr_rows = _ocr_page(pdf_bytes, page_no - 1)
-                    if ocr_rows:
-                        tables = [ocr_rows]
-                        method = "tesseract OCR (layout heuristic)"
-                except Exception as exc:
-                    page_log.append({"page": page_no, "method": "OCR failed", "tables": 0, "note": str(exc)[:180]})
-                    continue
-            page_log.append({
-                "page": page_no,
-                "method": method if tables else "no table detected",
-                "tables": len(tables),
-                "note": "" if tables else "No table detected; page may be text-only or difficult to read."
-            })
-            for table_no, rows in enumerate(tables, start=1):
-                normalized = normalize_table(rows)
-                if normalized:
-                    page_tables.append({
-                        "page": page_no,
-                        "table_no": table_no,
-                        "columns": normalized["columns"],
-                        "data": normalized["data"],
-                        "method": method,
-                    })
-    stitched = stitch_tables(page_tables)
-    return stitched, page_log
+        words.append({
+            "text": word,
+            "x1": left,
+            "x2": left + width,
+            "cy": top + height / 2,
+            "height": height,
+        })
+
+    if not words:
+        return []
+
+    # Group words into visual rows by their vertical centers.
+    words.sort(key=lambda w: w["cy"])
+    lines = []
+
+    for word in words:
+        tolerance = max(8, word["height"] * 0.65)
+        best_line = None
+        best_distance = float("inf")
+
+        for line in lines[-3:]:
+            center = sum(w["cy"] for w in line) / len(line)
+            distance = abs(word["cy"] - center)
+
+            if distance <= tolerance and distance < best_distance:
+                best_line = line
+                best_distance = distance
+
+        if best_line is None:
+            lines.append([word])
+        else:
+            best_line.append(word)
+
+    # Split each visual row into approximate cells using horizontal gaps.
+    rows = []
+    for line in lines:
+        line.sort(key=lambda w: w["x1"])
+        heights = sorted(w["height"] for w in line)
+        median_height = heights[len(heights) // 2]
+        gap_threshold = max(14, median_height * 1.5)
+
+        cells = []
+        current = line[0]["text"]
+        previous_x2 = line[0]["x2"]
+
+        for word in line[1:]:
+            gap = word["x1"] - previous_x2
+
+            if gap > gap_threshold:
+                cells.append(current.strip())
+                current = word["text"]
+            else:
+                current += " " + word["text"]
+
+            previous_x2 = word["x2"]
+
+        cells.append(current.strip())
+
+        if len(cells) >= 2:
+            rows.append(cells)
+
+    # Avoid treating a page with only a few unrelated words as a table.
+    if len(rows) < 3:
+        return []
+
+    return rows
