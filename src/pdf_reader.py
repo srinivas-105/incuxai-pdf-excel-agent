@@ -4,14 +4,13 @@ Digital PDFs : pdfplumber (ruled tables first, then text-aligned tables).
 Scanned PDFs : PyMuPDF render -> OpenCV (orientation, deskew, ruling-line
                detection) -> Tesseract word boxes -> grid reconstruction.
 
-Public API (unchanged): extract_pdf(pdf_bytes, use_ocr=True, max_pages=50)
+Public API: extract_pdf(pdf_bytes, use_ocr=True, max_pages=50, lang="eng")
 returns (stitched_tables, page_log).
 """
 import io
 import re
 from bisect import bisect_right
 
-import cv2
 import numpy as np
 import pdfplumber
 import pytesseract
@@ -21,6 +20,15 @@ try:
     import pymupdf
 except ImportError:  # older PyMuPDF
     import fitz as pymupdf
+
+# OpenCV is loaded defensively: if it is broken in the environment, digital
+# PDFs still work and scanned pages report a clear error instead of crashing.
+try:
+    import cv2
+    _CV2_ERROR = None
+except Exception as _exc:  # ImportError, libGL.so.1 missing, etc.
+    cv2 = None
+    _CV2_ERROR = _exc
 
 from src.table_stitcher import normalize_table, stitch_tables
 
@@ -113,9 +121,16 @@ def _digital_tables(page):
 
 
 # --------------------------------------------------------------------------
-# Scanned PDFs: rendering and image preparation
+# Scanned PDFs: environment checks, rendering, image preparation
 # --------------------------------------------------------------------------
-def _ensure_tesseract():
+def _ensure_ocr_stack():
+    if cv2 is None:
+        raise RuntimeError(
+            f"OpenCV failed to import ({type(_CV2_ERROR).__name__}: "
+            f"{str(_CV2_ERROR)[:150]}). Use only 'opencv-python-headless' "
+            "in requirements.txt, add 'libgl1' to packages.txt, then "
+            "delete and redeploy the app."
+        )
     try:
         pytesseract.get_tesseract_version()
     except Exception as exc:
@@ -131,7 +146,6 @@ def _render_gray(doc, page_index):
     longest = max(page.rect.width, page.rect.height) * scale
     if longest > MAX_RENDER_SIDE:
         scale *= MAX_RENDER_SIDE / longest
-    pix = pymupdf.Pixmap  # noqa: F841 (keeps linters quiet about the import)
     pix = page.get_pixmap(
         matrix=pymupdf.Matrix(scale, scale),
         colorspace=pymupdf.csGRAY,
@@ -470,7 +484,7 @@ def _borderless_tables(words, width, med_h, min_gap):
 
 
 def _extract_scanned_page(doc, page_index, lang="eng"):
-    _ensure_tesseract()
+    _ensure_ocr_stack()
 
     gray = _render_gray(doc, page_index)
     if np.count_nonzero(gray < 160) < 0.0005 * gray.size:
