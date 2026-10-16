@@ -1,95 +1,119 @@
-"""PDF table extraction.
+    try:
+        total_pages = len(pdf.pages)
+        if total_pages > max_pages:
+            raise ValueError(
+                f"PDF has {total_pages} pages; configured limit is {max_pages}."
+            )
 
-Digital PDFs : pdfplumber (ruled tables first, then text-aligned tables).
-Scanned PDFs : PyMuPDF render -> OpenCV (orientation, deskew, ruling-line
-               detection) -> Tesseract word boxes -> grid reconstruction.
+        for page_index, page in enumerate(pdf.pages):
+            page_no = page_index + 1
+            method = "pdfplumber"
+            note = ""
 
-Public API: extract_pdf(pdf_bytes, use_ocr=True, max_pages=50, lang="eng")
-returns (stitched_tables, page_log).
-"""
-import io
-import re
-from bisect import bisect_right
+            try:
+                tables = _digital_tables(page)
+            except Exception as exc:
+                tables = []
+                note = f"pdfplumber failed: {type(exc).__name__}"
 
-import numpy as np
-import pdfplumber
-import pytesseract
-from PIL import Image
+            if not tables and use_ocr:
+                try:
+                    if ocr_doc is None:
+                        ocr_doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+                    tables = _extract_scanned_page(ocr_doc, page_index, lang)
+                    method = OCR_METHOD
+                    note = "" if tables else (
+                        "No reliable table was detected. "
+                        "Review the scan quality and table layout."
+                    )
+                except Exception as exc:
+                    tables = []
+                    method = "OCR failed"
+                    note = f"{type(exc).__name__}: {str(exc)[:250]}"
+            elif not tables:
+                method = "no table detected"
+                note = note or "No digital table found; OCR is disabled."
 
-try:
-    import pymupdf
-except ImportError:  # older PyMuPDF
-    import fitz as pymupdf
+            # "page" is always a string so Streamlit/Arrow can serialise
+            # the log even when it contains the "Summary" row.
+            entry = {
+                "page": str(page_no),
+                "method": method,
+                "tables": len(tables),
+                "note": note,
+            }
+            page_log.append(entry)
 
-# OpenCV is loaded defensively: if it is broken in the environment, digital
-# PDFs still work and scanned pages report a clear error instead of crashing.
-try:
-    import cv2
-    _CV2_ERROR = None
-except Exception as _exc:  # ImportError, libGL.so.1 missing, etc.
-    cv2 = None
-    _CV2_ERROR = _exc
+            for table_no, rows in enumerate(tables, start=1):
+                try:
+                    cleaned_rows = _tidy(rows)
+                    normalized = None
 
-from src.table_stitcher import normalize_table, stitch_tables
+                    # If this page starts with a record rather than a header,
+                    # reuse the prior page's header when the column count fits.
+                    # Keep every row as data in this branch, including row 1.
+                    if (
+                        last_columns
+                        and cleaned_rows
+                        and _looks_like_record_row(cleaned_rows[0])
+                        and max(map(len, cleaned_rows), default=0) == len(last_columns)
+                    ):
+                        width = len(last_columns)
+                        data_rows = [r[:width] + [""] * max(0, width - len(r)) for r in cleaned_rows]
+                        normalized = {"columns": list(last_columns), "data": data_rows}
+                    else:
+                        normalized = normalize_table(cleaned_rows)
+                except Exception as exc:
+                    entry["note"] = f"Normalization failed: {str(exc)[:180]}"
+                    continue
 
-OCR_METHOD = "PyMuPDF + OpenCV + Tesseract OCR"
-RENDER_DPI = 300
-MAX_RENDER_SIDE = 5000
-MIN_WORD_CONF = 30
+                if not normalized:
+                    entry["note"] = (
+                        "Table was detected but could not be normalized."
+                    )
+                    continue
 
+                columns = normalized["columns"]
+                data = normalized["data"]
+                # Update carry-forward headers only when the first row looks
+                # like a real header, not a record identifier.
+                if cleaned_rows and not _looks_like_record_row(cleaned_rows[0]):
+                    last_columns = list(columns)
 
-# --------------------------------------------------------------------------
-# Generic helpers
-# --------------------------------------------------------------------------
-def _clean_cell(value):
-    if value is None:
-        return ""
-    return re.sub(r"\s+", " ", str(value)).strip()
+                page_tables.append({
+                    "page": page_no,
+                    "table_no": table_no,
+                    "columns": columns,
+                    "data": data,
+                    "method": method,
+                })
 
+            # Release per-page caches (pdfplumber keeps them otherwise).
+            try:
+                page.flush_cache()
+            except Exception:
+                pass
+    finally:
+        pdf.close()
+        if ocr_doc is not None:
+            ocr_doc.close()
 
-def _tidy(rows):
-    """Clean cells, pad to equal width, drop empty rows and empty columns."""
-    rows = [[_clean_cell(c) for c in r] for r in rows if r]
-    rows = [r for r in rows if any(r)]
-    if not rows:
-        return []
-    width = max(len(r) for r in rows)
-    rows = [r + [""] * (width - len(r)) for r in rows]
-    keep = [j for j in range(width) if any(r[j] for r in rows)]
-    return [[r[j] for j in keep] for r in rows]
+    try:
+        stitched = stitch_tables(page_tables)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to combine tables across pages: {exc}"
+        ) from exc
 
+    if not stitched:
+        page_log.append({
+            "page": "Summary",
+            "method": "extraction unsuccessful",
+            "tables": 0,
+            "note": (
+                "No usable tables were extracted. Check the OCR dependency, "
+                "scan quality, and table layout."
+            ),
+        })
 
-def _looks_like_table(rows, min_rows=2, min_fill=0.35, max_avg_len=None):
-    if len(rows) < min_rows or not rows or len(rows[0]) < 2:
-        return False
-    cells = [c for r in rows for c in r]
-    filled = [c for c in cells if c]
-    if not filled or len(filled) / len(cells) < min_fill:
-        return False
-    if max_avg_len and sum(map(len, filled)) / len(filled) > max_avg_len:
-        return False
-    return True
-
-
-# --------------------------------------------------------------------------
-# Digital PDFs (selectable text)
-# --------------------------------------------------------------------------
-def _digital_tables(page):
-    strategies = [
-        (
-            {
-                "vertical_strategy": "lines",
-                "horizontal_strategy": "lines",
-                "intersection_tolerance": 5,
-            },
-            False,
-        ),
-        (
-            {
-                "vertical_strategy": "text",
-                "horizontal_strategy": "text",
-                "snap_tolerance": 3,
-            },
-            True,
-        ),
-    ]
+    return stitched, page_log
