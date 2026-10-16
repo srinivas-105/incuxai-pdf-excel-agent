@@ -6,4 +6,5 @@ PyMuPDF
 pytesseract
 Pillow
 numpy
-img2table
+tesseract-ocr
+tesseract-ocr-eng
