@@ -1,9 +1,8 @@
 streamlit
+pdfplumber
+pytesseract
+PyMuPDF
+Pillow
 pandas
 openpyxl
-pdfplumber
-PyMuPDF
-pytesseract
-Pillow
-numpy
-
+opencv-python-headless
