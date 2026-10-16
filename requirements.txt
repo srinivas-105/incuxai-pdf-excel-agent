@@ -6,5 +6,4 @@ PyMuPDF
 pytesseract
 Pillow
 numpy
-tesseract-ocr
-tesseract-ocr-eng
+
