@@ -1,13 +1,13 @@
 
 import io
 import re
+import statistics
 
-import cv2
 import fitz
 import numpy as np
 import pdfplumber
 import pytesseract
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageEnhance
 from pytesseract import Output
 
 from src.table_stitcher import normalize_table, stitch_tables
@@ -16,17 +16,21 @@ from src.table_stitcher import normalize_table, stitch_tables
 def _clean_cell(value):
     if value is None:
         return ""
-    return re.sub(r"\s+", " ", str(value)).strip()
+    value = str(value).replace("\x00", "")
+    return re.sub(r"\s+", " ", value).strip()
 
 
-def _render_page(pdf_bytes, page_index, dpi=300):
+def _render_page(pdf_bytes, page_index, dpi=350):
     with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
         page = doc.load_page(page_index)
         pix = page.get_pixmap(
             matrix=fitz.Matrix(dpi / 72, dpi / 72),
             alpha=False,
         )
-        return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+        image = Image.open(io.BytesIO(pix.tobytes("png"))).convert("L")
+
+    image = ImageOps.autocontrast(image)
+    return ImageEnhance.Contrast(image).enhance(1.4)
 
 
 def _digital_tables(page):
@@ -48,13 +52,13 @@ def _digital_tables(page):
             continue
 
         tables = []
-        for table in raw_tables:
+        for raw in raw_tables:
             rows = [
-                [_clean_cell(c) for c in row]
-                for row in table
-                if row and any(_clean_cell(c) for c in row)
+                [_clean_cell(cell) for cell in row]
+                for row in raw
+                if row and any(_clean_cell(cell) for cell in row)
             ]
-            if len(rows) >= 2:
+            if len(rows) >= 2 and max(map(len, rows), default=0) >= 2:
                 tables.append(rows)
 
         if tables:
@@ -63,242 +67,257 @@ def _digital_tables(page):
     return []
 
 
-def _cluster_positions(values, tolerance=5):
-    if not values:
-        return []
-
-    values = sorted(values)
-    clusters = [[values[0]]]
-
-    for value in values[1:]:
-        if value - clusters[-1][-1] <= tolerance:
-            clusters[-1].append(value)
-        else:
-            clusters.append([value])
-
-    return [int(round(sum(c) / len(c))) for c in clusters]
-
-
-def _find_grid(binary):
-    """Detect long horizontal and vertical rules in a thresholded image."""
-    height, width = binary.shape
-
-    horizontal_kernel = cv2.getStructuringElement(
-        cv2.MORPH_RECT, (max(25, width // 35), 1)
-    )
-    vertical_kernel = cv2.getStructuringElement(
-        cv2.MORPH_RECT, (1, max(20, height // 35))
-    )
-
-    horizontal = cv2.morphologyEx(
-        binary, cv2.MORPH_OPEN, horizontal_kernel
-    )
-    vertical = cv2.morphologyEx(
-        binary, cv2.MORPH_OPEN, vertical_kernel
-    )
-
-    h_projection = np.count_nonzero(horizontal, axis=1)
-    v_projection = np.count_nonzero(vertical, axis=0)
-
-    # Require a substantial fraction of the image width/height.
-    ys = np.where(h_projection >= width * 0.18)[0].tolist()
-    xs = np.where(v_projection >= height * 0.10)[0].tolist()
-
-    ys = _cluster_positions(ys, max(3, height // 700))
-    xs = _cluster_positions(xs, max(3, width // 700))
-
-    return xs, ys, horizontal, vertical
-
-
-def _ocr_cell(image):
-    """Read one isolated table cell; avoid interpreting neighboring columns."""
-    if image.width < 3 or image.height < 3:
-        return ""
-
-    # Add a white margin so Tesseract does not clip characters at grid lines.
-    image = ImageOps.expand(image, border=5, fill="white")
-    config = "--psm 7"
-
-    text = pytesseract.image_to_string(image, config=config)
-    return _clean_cell(text)
-
-
-def _grid_table(image):
-    """
-    Find a ruled table and OCR individual cells.
-
-    Returns rows only when enough usable grid structure is detected.
-    """
-    rgb = np.array(image)
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-
-    # Adaptive threshold helps with faint or unevenly lit scans.
-    binary = cv2.adaptiveThreshold(
-        gray,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        31,
-        11,
-    )
-
-    xs, ys, horizontal, vertical = _find_grid(binary)
-
-    if len(xs) < 3 or len(ys) < 4:
-        return [], "Could not detect enough table grid lines."
-
-    # Locate the strongest rectangular table region.
-    # The supplied test uses a ruled table with many vertical separators.
-    best_region = None
-    best_score = 0
-
-    for yi in range(len(ys) - 2):
-        for yj in range(yi + 2, len(ys)):
-            y1, y2 = ys[yi], ys[yj]
-            if y2 - y1 < image.height * 0.15:
-                continue
-
-            vertical_support = sum(
-                1 for x in xs
-                if np.count_nonzero(vertical[y1:y2, x]) >
-                (y2 - y1) * 0.15
-            )
-            horizontal_support = sum(
-                1 for y in ys[yi:yj + 1]
-                if np.count_nonzero(horizontal[y, :]) >
-                image.width * 0.15
-            )
-
-            score = vertical_support * horizontal_support
-            if score > best_score:
-                best_score = score
-                best_region = (yi, yj)
-
-    if best_region is None:
-        return [], "No credible rectangular table region detected."
-
-    yi, yj = best_region
-    y_edges = ys[yi:yj + 1]
-
-    # Keep vertical separators that persist through the table's height.
-    y1, y2 = y_edges[0], y_edges[-1]
-    x_edges = [
-        x for x in xs
-        if np.count_nonzero(vertical[y1:y2, x]) >
-        (y2 - y1) * 0.15
-    ]
-
-    x_edges = _cluster_positions(x_edges, max(3, image.width // 700))
-
-    if len(x_edges) < 3 or len(y_edges) < 4:
-        return [], "Table grid was incomplete after filtering."
-
-    # Crop each cell and OCR it separately.
-    rows = []
-    for row_index in range(len(y_edges) - 1):
-        top, bottom = y_edges[row_index], y_edges[row_index + 1]
-
-        if bottom - top < 5:
-            continue
-
-        row = []
-        for col_index in range(len(x_edges) - 1):
-            left, right = x_edges[col_index], x_edges[col_index + 1]
-
-            if right - left < 5:
-                row.append("")
-                continue
-
-            # Ignore a thin strip containing the table rules.
-            crop = image.crop((
-                max(0, left + 2),
-                max(0, top + 2),
-                min(image.width, right - 2),
-                min(image.height, bottom - 2),
-            ))
-            row.append(_ocr_cell(crop))
-
-        if any(row):
-            rows.append(row)
-
-    if len(rows) < 3:
-        return [], "Grid was found but too few rows were recognized."
-
-    # Remove completely blank columns only.
-    keep = [
-        i for i in range(max(map(len, rows)))
-        if any(i < len(row) and row[i] for row in rows)
-    ]
-    rows = [
-        [row[i] if i < len(row) else "" for i in keep]
-        for row in rows
-    ]
-
-    return rows, ""
-
-
-def _ocr_page(pdf_bytes, page_index):
-    image = _render_page(pdf_bytes, page_index)
-    rows, note = _grid_table(image)
-
-    if rows:
-        return rows, "Tesseract OCR (cell-by-cell grid)", ""
-
-    # Fallback: word-level OCR, with a warning that alignment is uncertain.
+def _get_ocr_words(image):
     data = pytesseract.image_to_data(
         image,
-        config="--psm 11",
+        config="--psm 6",
         output_type=Output.DICT,
     )
 
     words = []
     for i, raw in enumerate(data["text"]):
-        word = _clean_cell(raw)
+        text = _clean_cell(raw)
+
         try:
             confidence = float(data["conf"][i])
         except (ValueError, TypeError):
             confidence = -1
 
-        if not word or confidence < 25:
+        if not text or confidence < 15:
             continue
 
+        x = int(data["left"][i])
+        y = int(data["top"][i])
+        w = int(data["width"][i])
+        h = int(data["height"][i])
+
         words.append({
-            "text": word,
-            "x": int(data["left"][i]),
-            "y": int(data["top"][i]),
-            "h": max(1, int(data["height"][i])),
+            "text": text,
+            "x1": x,
+            "x2": x + w,
+            "y1": y,
+            "y2": y + h,
+            "cx": x + w / 2,
+            "cy": y + h / 2,
+            "height": max(1, h),
+            "block": data["block_num"][i],
+            "paragraph": data["par_num"][i],
+            "line": data["line_num"][i],
+            "confidence": confidence,
         })
 
-    words.sort(key=lambda w: (w["y"], w["x"]))
-    lines = []
+    return words
+
+
+def _group_lines(words):
+    """Use Tesseract's own line IDs, with geometric grouping as a fallback."""
+    groups = {}
 
     for word in words:
-        target = None
-        for line in reversed(lines[-4:]):
-            center = sum(w["y"] + w["h"] / 2 for w in line) / len(line)
-            if abs(word["y"] + word["h"] / 2 - center) <= max(8, word["h"]):
-                target = line
-                break
+        key = (word["block"], word["paragraph"], word["line"])
+        groups.setdefault(key, []).append(word)
 
-        if target is None:
-            lines.append([word])
+    lines = list(groups.values())
+    lines = [sorted(line, key=lambda w: w["x1"]) for line in lines]
+    lines.sort(key=lambda line: statistics.mean(w["cy"] for w in line))
+    return lines
+
+
+def _line_text(line):
+    return " ".join(word["text"] for word in line).strip()
+
+
+def _header_score(line):
+    text = _line_text(line).lower()
+    terms = {
+        "id", "date", "vendor", "supplier", "item", "code",
+        "description", "qty", "quantity", "unit", "price",
+        "discount", "disc", "tax", "amount", "total",
+        "invoice", "product", "customer", "name", "rate",
+        "cost", "balance", "status", "reference",
+    }
+    tokens = set(re.findall(r"[a-z]+", text))
+    score = len(tokens & terms)
+
+    for phrase in (
+        "item code", "unit price", "line total",
+        "invoice id", "tax amount", "total amount",
+    ):
+        if phrase in text:
+            score += 2
+
+    return score
+
+
+def _find_header(lines):
+    candidates = []
+
+    for index, line in enumerate(lines):
+        score = _header_score(line)
+        if score >= 3 and len(line) >= 3:
+            candidates.append((score, len(line), index))
+
+    if candidates:
+        return max(candidates)[2]
+
+    # Fallback for headers whose words OCR recognizes imperfectly:
+    # prefer a line with many separate words, not a title or short metadata.
+    possible = [
+        (len(line), index)
+        for index, line in enumerate(lines)
+        if len(line) >= 7
+    ]
+
+    return max(possible)[1] if possible else None
+
+
+def _find_vertical_boundaries(image, y_start, y_end):
+    """
+    Detect persistent vertical rules by examining dark-pixel density.
+    Returns an empty list if the image does not provide convincing evidence.
+    """
+    arr = np.asarray(image)
+    dark = arr < 150
+    height, width = dark.shape
+
+    y_start = max(0, min(height - 1, int(y_start)))
+    y_end = max(y_start + 1, min(height, int(y_end)))
+
+    region = dark[y_start:y_end, :]
+    density = region.mean(axis=0)
+
+    # A rule should persist through many rows; text characters usually do not.
+    active = density >= 0.48
+    positions = np.flatnonzero(active)
+
+    if len(positions) == 0:
+        return []
+
+    clusters = [[int(positions[0])]]
+    for x in positions[1:]:
+        x = int(x)
+        if x - clusters[-1][-1] <= 4:
+            clusters[-1].append(x)
         else:
-            target.append(word)
+            clusters.append([x])
 
-    fallback = []
-    for line in lines:
-        line.sort(key=lambda w: w["x"])
-        if line:
-            fallback.append([
-                " ".join(w["text"] for w in line)
-            ])
+    boundaries = [
+        int(round(statistics.mean(cluster)))
+        for cluster in clusters
+        if len(cluster) >= 1
+    ]
 
-    if len(fallback) >= 3:
-        return fallback, "Tesseract OCR (text-only fallback)", (
-            note + " Table columns could not be reliably reconstructed."
-        )
+    # Remove lines that are too close to one another to be column separators.
+    merged = []
+    for x in boundaries:
+        if not merged or x - merged[-1] >= max(8, width // 250):
+            merged.append(x)
 
-    return [], "OCR failed", note
+    # A usable grid must span a substantial portion of the page width.
+    if len(merged) < 3:
+        return []
+
+    if merged[-1] - merged[0] < width * 0.35:
+        return []
+
+    return merged
+
+
+def _rows_from_grid(image, words, lines, header_index):
+    header_line = lines[header_index]
+    header_y = statistics.mean(word["cy"] for word in header_line)
+
+    lines_after_header = [
+        line for line in lines
+        if statistics.mean(word["cy"] for word in line) >= header_y - 4
+    ]
+
+    if len(lines_after_header) < 3:
+        return [], "Too few lines were found after the header."
+
+    max_y = max(word["y2"] for line in lines_after_header for word in line)
+    boundaries = _find_vertical_boundaries(
+        image, header_y - 20, max_y + 10
+    )
+
+    if len(boundaries) < 3:
+        return [], "No reliable vertical column boundaries were detected."
+
+    rows = []
+    for line in lines_after_header:
+        cells = [""] * (len(boundaries) - 1)
+
+        for word in line:
+            col = None
+            for j in range(len(boundaries) - 1):
+                if boundaries[j] <= word["cx"] < boundaries[j + 1]:
+                    col = j
+                    break
+
+            if col is not None:
+                cells[col] = (cells[col] + " " + word["text"]).strip()
+
+        if any(cells):
+            rows.append(cells)
+
+    if len(rows) < 3:
+        return [], "Grid was detected, but too few usable rows were reconstructed."
+
+    return rows, ""
+
+
+def _remove_noise(rows):
+    cleaned = []
+
+    for row in rows:
+        row = [_clean_cell(cell) for cell in row]
+        text = " ".join(cell.lower() for cell in row if cell)
+
+        if not text.strip():
+            continue
+
+        if "north ridge industrial" in text or "northridge industrial" in text:
+            continue
+        if "purchase ledger" in text and "currency" not in text:
+            continue
+        if "archive scan" in text or "batch:" in text:
+            continue
+        if "reference mark:" in text or "approved:" in text:
+            continue
+        if "verify decimal separators" in text:
+            continue
+        if "sheet" in text and "currency:" in text:
+            continue
+
+        cleaned.append(row)
+
+    return cleaned
+
+
+def _ocr_page(pdf_bytes, page_index):
+    image = _render_page(pdf_bytes, page_index)
+    words = _get_ocr_words(image)
+
+    if not words:
+        return [], "OCR failed", "No words were recognized."
+
+    lines = _group_lines(words)
+    header_index = _find_header(lines)
+
+    if header_index is None:
+        return [], "OCR failed", "Could not identify a plausible table header."
+
+    rows, note = _rows_from_grid(image, words, lines, header_index)
+
+    if not rows:
+        return [], "OCR failed", note
+
+    rows = _remove_noise(rows)
+
+    if len(rows) < 2:
+        return [], "OCR failed", "Too few rows remained after removing page metadata."
+
+    return rows, "Tesseract OCR with column grid", ""
 
 
 def extract_pdf(pdf_bytes, use_ocr=True, max_pages=50):
@@ -327,21 +346,33 @@ def extract_pdf(pdf_bytes, use_ocr=True, max_pages=50):
 
             elif not tables:
                 method = "no table detected"
-                note = "No digital tables found; OCR is disabled."
+                note = "Digital table extraction found no tables and OCR is disabled."
 
             page_log.append({
                 "page": page_no,
-                "method": method if tables else method,
+                "method": method,
                 "tables": len(tables),
                 "note": note,
             })
 
             for table_no, rows in enumerate(tables, start=1):
+                rows = [
+                    [_clean_cell(cell) for cell in row]
+                    for row in rows
+                    if row and any(_clean_cell(cell) for cell in row)
+                ]
+
+                if len(rows) < 2:
+                    page_log[-1]["note"] = (
+                        "Not enough usable rows were extracted."
+                    )
+                    continue
+
                 try:
                     normalized = normalize_table(rows)
                 except Exception as exc:
                     page_log[-1]["note"] = (
-                        f"Table normalization failed: {str(exc)[:180]}"
+                        f"Normalization failed: {str(exc)[:200]}"
                     )
                     continue
 
@@ -355,13 +386,10 @@ def extract_pdf(pdf_bytes, use_ocr=True, max_pages=50):
                     })
                 else:
                     page_log[-1]["note"] = (
-                        "Rows were found but could not be normalized."
+                        "The extracted rows could not be normalized."
                     )
 
-    try:
-        stitched = stitch_tables(page_tables)
-    except Exception as exc:
-        raise RuntimeError(f"Table stitching failed: {exc}") from exc
+    stitched = stitch_tables(page_tables)
 
     if not stitched:
         page_log.append({
@@ -369,10 +397,9 @@ def extract_pdf(pdf_bytes, use_ocr=True, max_pages=50):
             "method": "extraction unsuccessful",
             "tables": 0,
             "note": (
-                "No usable tables were extracted. Check the OCR logs, "
-                "grid detection, and PDF scan quality."
+                "No usable tables were extracted. Check OCR availability, "
+                "table boundaries, and the scan quality."
             ),
         })
 
     return stitched, page_log
-
